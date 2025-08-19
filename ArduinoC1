@@ -1,0 +1,433 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <ESPping.h>
+#include <vector>
+#include <set>
+
+// Configuración del servidor web
+WebServer server(80);
+
+// Variables globales
+String connectedSSID = "";
+IPAddress deviceIP;
+IPAddress subnetMask(255, 255, 255, 240);
+IPAddress networkAddr;
+IPAddress broadcastAddr;
+unsigned long lastScan = 0;
+unsigned long scanInterval = 10000; // 10 segundos por defecto
+
+// Estructura para almacenar dispositivos detectados
+struct NetworkDevice {
+  IPAddress ip;
+  String mac;
+  String hostname;
+  bool active;
+  unsigned long lastSeen;
+};
+
+std::vector<NetworkDevice> detectedDevices;
+
+// Estructura para redes WiFi
+struct WiFiNetwork {
+  String ssid;
+  int32_t rssi;
+  String encryption;
+  int32_t channel;
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("Inicializando ESP32-S3 WiFi Scanner...");
+  
+  // Configurar modo WiFi
+  WiFi.mode(WIFI_AP_STA);
+  
+  // Crear punto de acceso para configuración inicial
+  WiFi.softAP("ESP32-WiFiConfig", "12345678");
+  Serial.print("Punto de acceso creado: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Configurar servidor web
+  setupWebServer();
+  
+  Serial.println("Sistema listo. Accede a http://192.168.4.1");
+  Serial.println("Interfaz Python debe conectarse a esta IP");
+}
+
+void loop() {
+  server.handleClient();
+  
+  // Actualizar escaneo de dispositivos según el intervalo configurado
+  if (millis() - lastScan > scanInterval) {
+    if (WiFi.status() == WL_CONNECTED) {
+      scanNetworkDevices();
+    }
+    lastScan = millis();
+  }
+  
+  delay(10);
+}
+
+void setupWebServer() {
+  // Configurar CORS para todas las rutas
+  server.enableCORS(true);
+  
+  // Endpoint para obtener redes WiFi disponibles
+  server.on("/scan", HTTP_GET, handleScanWiFi);
+  
+  // Endpoint para conectar a una red WiFi
+  server.on("/connect", HTTP_POST, handleConnect);
+  
+  // Endpoint para obtener estado de conexión
+  server.on("/status", HTTP_GET, handleStatus);
+  
+  // Endpoint para obtener dispositivos detectados en la red
+  server.on("/devices", HTTP_GET, handleDevices);
+  
+  // Endpoint para desconectar WiFi
+  server.on("/disconnect", HTTP_POST, handleDisconnect);
+  
+  // Endpoint para configurar intervalo de escaneo
+  server.on("/set_interval", HTTP_POST, handleSetInterval);
+  
+  // Manejar preflight OPTIONS requests para CORS
+  server.on("/scan", HTTP_OPTIONS, handleCORS);
+  server.on("/connect", HTTP_OPTIONS, handleCORS);
+  server.on("/status", HTTP_OPTIONS, handleCORS);
+  server.on("/devices", HTTP_OPTIONS, handleCORS);
+  server.on("/disconnect", HTTP_OPTIONS, handleCORS);
+  server.on("/set_interval", HTTP_OPTIONS, handleCORS);
+  
+  // Iniciar servidor
+  server.begin();
+  Serial.println("Servidor web iniciado en puerto 80");
+}
+
+void handleCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.send(200, "text/plain", "");
+}
+
+void handleScanWiFi() {
+  Serial.println("Escaneando redes WiFi...");
+  
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  int n = WiFi.scanNetworks(false, true);  // Escaneo asíncrono y ocultar redes ocultas
+  
+  // Esperar hasta que el escaneo termine
+  while (WiFi.scanComplete() == -1) {
+    delay(100);
+    server.handleClient();
+  }
+  
+  n = WiFi.scanComplete();
+  
+  DynamicJsonDocument doc(4096);
+  JsonArray networks = doc.createNestedArray("networks");
+  
+  // Usar un conjunto para evitar duplicados
+  std::set<String> seenNetworks;
+  
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    
+    // Saltar redes sin nombre y verificar duplicados
+    if (ssid.length() == 0 || seenNetworks.find(ssid) != seenNetworks.end()) {
+      continue;
+    }
+    
+    seenNetworks.insert(ssid);
+    
+    JsonObject network = networks.createNestedObject();
+    network["ssid"] = ssid;
+    network["rssi"] = WiFi.RSSI(i);
+    network["encryption"] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured";
+    network["channel"] = WiFi.channel(i);
+    
+    Serial.printf("Red encontrada: %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
+  }
+  
+  WiFi.scanDelete();  // Liberar memoria
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleConnect() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  if (!server.hasArg("ssid")) {
+    server.send(400, "application/json", "{\"error\":\"Missing SSID parameter\"}");
+    return;
+  }
+  
+  String ssid = server.arg("ssid");
+  String password = server.hasArg("password") ? server.arg("password") : "";
+  
+  Serial.println("Intentando conectar a: " + ssid);
+  
+  bool success = connectToWiFi(ssid, password);
+  
+  DynamicJsonDocument doc(512);
+  doc["success"] = success;
+  
+  if (success) {
+    doc["ip"] = WiFi.localIP().toString();
+    doc["ssid"] = WiFi.SSID();
+    calculateNetworkRange();
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  DynamicJsonDocument doc(512);
+  doc["connected"] = (WiFi.status() == WL_CONNECTED);
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    doc["ssid"] = WiFi.SSID();
+    doc["ip"] = WiFi.localIP().toString();
+    doc["rssi"] = WiFi.RSSI();
+    doc["gateway"] = WiFi.gatewayIP().toString();
+    doc["dns"] = WiFi.dnsIP().toString();
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleDevices() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  DynamicJsonDocument doc(4096);
+  JsonArray devices = doc.createNestedArray("devices");
+  
+  // Agregar información del propio dispositivo
+  JsonObject selfDevice = devices.createNestedObject();
+  selfDevice["ip"] = WiFi.localIP().toString();
+  selfDevice["type"] = "Self (ESP32-S3)";
+  selfDevice["active"] = true;
+  selfDevice["mac"] = WiFi.macAddress();
+  selfDevice["hostname"] = WiFi.getHostname();
+  
+  // Agregar dispositivos detectados
+  for (const auto &device : detectedDevices) {
+    if (device.active) {
+      JsonObject deviceObj = devices.createNestedObject();
+      deviceObj["ip"] = device.ip.toString();
+      deviceObj["type"] = "Network Device";
+      deviceObj["active"] = device.active;
+      deviceObj["mac"] = device.mac.length() > 0 ? device.mac : "Unknown";
+      deviceObj["hostname"] = device.hostname.length() > 0 ? device.hostname : "Unknown";
+      deviceObj["lastSeen"] = device.lastSeen;
+    }
+  }
+  
+  // Agregar información de la red
+  if (WiFi.status() == WL_CONNECTED) {
+    doc["networkInfo"]["subnet"] = subnetMask.toString();
+    doc["networkInfo"]["network"] = networkAddr.toString();
+    doc["networkInfo"]["broadcast"] = broadcastAddr.toString();
+    doc["networkInfo"]["gateway"] = WiFi.gatewayIP().toString();
+    doc["networkInfo"]["dns"] = WiFi.dnsIP().toString();
+  }
+  
+  doc["networkInfo"]["totalDevices"] = devices.size();
+  doc["networkInfo"]["scanTime"] = millis();
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleDisconnect() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  WiFi.disconnect();
+  connectedSSID = "";
+  detectedDevices.clear();
+  
+  Serial.println("Desconectado de WiFi");
+  
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleSetInterval() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  if (!server.hasArg("interval")) {
+    server.send(400, "application/json", "{\"error\":\"Missing interval parameter\"}");
+    return;
+  }
+  
+  unsigned long newInterval = server.arg("interval").toInt() * 1000; // Convertir a milisegundos
+  
+  if (newInterval < 1000) {
+    server.send(400, "application/json", "{\"error\":\"Interval must be at least 1 second\"}");
+    return;
+  }
+  
+  scanInterval = newInterval;
+  
+  DynamicJsonDocument doc(200);
+  doc["success"] = true;
+  doc["new_interval"] = scanInterval / 1000;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+  
+  Serial.printf("Intervalo de escaneo cambiado a: %lu segundos\n", scanInterval / 1000);
+}
+
+bool connectToWiFi(String ssid, String password) {
+  Serial.println("Conectando a: " + ssid);
+  
+  WiFi.begin(ssid.c_str(), password.c_str());
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+    
+    // Permitir que el servidor web siga funcionando durante la conexión
+    server.handleClient();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConectado exitosamente!");
+    Serial.print("IP asignada: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("DNS: ");
+    Serial.println(WiFi.dnsIP());
+    
+    connectedSSID = ssid;
+    deviceIP = WiFi.localIP();
+    calculateNetworkRange();
+    
+    return true;
+  } else {
+    Serial.println("\nFalló la conexión");
+    return false;
+  }
+}
+
+void calculateNetworkRange() {
+  // Calcular rango de red con máscara 255.255.255.240 (/28)
+  uint32_t ip = (uint32_t)deviceIP;
+  uint32_t mask = (uint32_t)subnetMask;
+  
+  uint32_t network = ip & mask;
+  uint32_t broadcast = network | (~mask);
+  
+  networkAddr = IPAddress(network);
+  broadcastAddr = IPAddress(broadcast);
+  
+  Serial.println("Rango de red calculado:");
+  Serial.print("Red: ");
+  Serial.println(networkAddr);
+  Serial.print("Broadcast: ");
+  Serial.println(broadcastAddr);
+  Serial.print("Dispositivos posibles: ");
+  Serial.println((broadcast - network - 1));
+}
+
+void scanNetworkDevices() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  
+  Serial.println("Escaneando dispositivos en la red...");
+  
+  uint32_t network = (uint32_t)networkAddr;
+  uint32_t broadcast = (uint32_t)broadcastAddr;
+  
+  // Marcar todos los dispositivos como no activos
+  for (auto &device : detectedDevices) {
+    device.active = false;
+  }
+  
+  int devicesFound = 0;
+  
+  // Escanear rango de IPs (excluyendo dirección de red y broadcast)
+  for (uint32_t ip = network + 1; ip < broadcast; ip++) {
+    IPAddress targetIP(ip);
+    
+    // Saltar nuestra propia IP
+    if (targetIP == deviceIP) continue;
+    
+    // Permitir que el servidor web siga funcionando
+    server.handleClient();
+    
+    // Hacer ping a la IP con timeout corto
+    if (Ping.ping(targetIP, 1)) {
+      Serial.print("Dispositivo encontrado: ");
+      Serial.println(targetIP);
+      devicesFound++;
+      
+      // Buscar si ya existe en la lista
+      bool found = false;
+      for (auto &device : detectedDevices) {
+        if (device.ip == targetIP) {
+          device.active = true;
+          device.lastSeen = millis();
+          found = true;
+          break;
+        }
+      }
+      
+      // Si no existe, agregarlo
+      if (!found) {
+        NetworkDevice newDevice;
+        newDevice.ip = targetIP;
+        newDevice.mac = getMACFromIP(targetIP);
+        newDevice.hostname = getHostnameFromIP(targetIP);
+        newDevice.active = true;
+        newDevice.lastSeen = millis();
+        detectedDevices.push_back(newDevice);
+      }
+    }
+    
+    delay(50); // Pausa reducida entre pings para mayor velocidad
+  }
+  
+  // Remover dispositivos inactivos después de 60 segundos
+  detectedDevices.erase(
+    std::remove_if(detectedDevices.begin(), detectedDevices.end(),
+      [](const NetworkDevice& device) {
+        return !device.active && (millis() - device.lastSeen > 60000);
+      }),
+    detectedDevices.end()
+  );
+  
+  Serial.printf("Escaneo completado. Dispositivos activos: %d\n", devicesFound);
+}
+
+// Función para obtener MAC address desde IP (simulada)
+String getMACFromIP(IPAddress ip) {
+  // En una implementación real, usarías ARP o similar
+  // Esta es una implementación simulada para demostración
+  return "MAC:" + String(ip[0]) + ":" + String(ip[1]) + ":" + String(ip[2]) + ":" + String(ip[3]);
+}
+
+// Función para obtener hostname desde IP (simulada)
+String getHostnameFromIP(IPAddress ip) {
+  // En una implementación real, usarías resolución DNS inversa
+  // Esta es una implementación simulada para demostración
+  return "Device-" + String(ip[2]) + "-" + String(ip[3]);
+}

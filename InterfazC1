@@ -1,0 +1,570 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import requests
+import json
+import threading
+import time
+from datetime import datetime
+import ipaddress
+
+class WiFiManagerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ESP32-S3 WiFi Manager & Network Scanner")
+        self.root.geometry("1200x800")
+        self.root.configure(bg='#2c3e50')
+        
+        # Variables
+        self.esp32_ip = "192.168.4.1"  # IP del punto de acceso del ESP32
+        self.connected = False
+        self.auto_refresh = True
+        self.refresh_interval = 10  # segundos
+        self.scan_interval = 5  # segundos por defecto para escaneo de dispositivos
+        
+        # Configurar estilo
+        self.setup_styles()
+        
+        # Crear interfaz
+        self.create_widgets()
+        
+        # Iniciar actualizaciones automáticas
+        self.start_auto_refresh()
+    
+    def setup_styles(self):
+        """Configurar estilos modernos para la interfaz"""
+        self.style = ttk.Style()
+        
+        # Configurar tema oscuro personalizado
+        self.style.theme_use('clam')
+        
+        # Colores
+        bg_color = '#2c3e50'
+        fg_color = '#ecf0f1'
+        accent_color = '#3498db'
+        success_color = '#27ae60'
+        warning_color = '#f39c12'
+        danger_color = '#e74c3c'
+        
+        # Configurar estilos
+        self.style.configure('Title.TLabel', 
+                           background=bg_color, 
+                           foreground=fg_color,
+                           font=('Arial', 16, 'bold'))
+        
+        self.style.configure('Subtitle.TLabel',
+                           background=bg_color,
+                           foreground=accent_color,
+                           font=('Arial', 12, 'bold'))
+        
+        self.style.configure('Info.TLabel',
+                           background=bg_color,
+                           foreground=fg_color,
+                           font=('Arial', 10))
+        
+        self.style.configure('Success.TLabel',
+                           background=bg_color,
+                           foreground=success_color,
+                           font=('Arial', 10, 'bold'))
+        
+        self.style.configure('Warning.TLabel',
+                           background=bg_color,
+                           foreground=warning_color,
+                           font=('Arial', 10, 'bold'))
+        
+        self.style.configure('Custom.TButton',
+                           background=accent_color,
+                           foreground='white',
+                           font=('Arial', 10, 'bold'),
+                           padding=10)
+    
+    def create_widgets(self):
+        """Crear todos los widgets de la interfaz"""
+        # Frame principal con scroll
+        main_frame = tk.Frame(self.root, bg='#2c3e50')
+        main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        # Título principal
+        title_label = ttk.Label(main_frame, 
+                               text="🛡️ ESP32-S3 WiFi Manager & Network Scanner", 
+                               style='Title.TLabel')
+        title_label.pack(pady=(0, 20))
+        
+        # Frame para configuración de ESP32
+        config_frame = self.create_config_section(main_frame)
+        config_frame.pack(fill='x', pady=(0, 20))
+        
+        # Frame para redes WiFi
+        wifi_frame = self.create_wifi_section(main_frame)
+        wifi_frame.pack(fill='both', expand=True, pady=(0, 20))
+        
+        # Frame para dispositivos de red
+        devices_frame = self.create_devices_section(main_frame)
+        devices_frame.pack(fill='both', expand=True)
+    
+    def create_config_section(self, parent):
+        """Crear sección de configuración del ESP32"""
+        frame = tk.LabelFrame(parent, text="Configuración ESP32", 
+                             bg='#34495e', fg='#ecf0f1', 
+                             font=('Arial', 12, 'bold'), padx=10, pady=10)
+        
+        # IP del ESP32
+        ip_frame = tk.Frame(frame, bg='#34495e')
+        ip_frame.pack(fill='x', pady=5)
+        
+        tk.Label(ip_frame, text="IP del ESP32:", 
+                bg='#34495e', fg='#ecf0f1', font=('Arial', 10)).pack(side='left')
+        
+        self.ip_entry = tk.Entry(ip_frame, font=('Arial', 10), width=15)
+        self.ip_entry.insert(0, self.esp32_ip)
+        self.ip_entry.pack(side='left', padx=(10, 0))
+        
+        # Botón para actualizar IP
+        update_ip_btn = tk.Button(ip_frame, text="Actualizar IP",
+                                 bg='#3498db', fg='white', font=('Arial', 9, 'bold'),
+                                 command=self.update_esp32_ip)
+        update_ip_btn.pack(side='left', padx=(10, 0))
+        
+        # Configuración de intervalo de escaneo
+        interval_frame = tk.Frame(frame, bg='#34495e')
+        interval_frame.pack(fill='x', pady=5)
+        
+        tk.Label(interval_frame, text="Intervalo de escaneo (s):", 
+                bg='#34495e', fg='#ecf0f1', font=('Arial', 10)).pack(side='left')
+        
+        self.interval_entry = tk.Entry(interval_frame, font=('Arial', 10), width=5)
+        self.interval_entry.insert(0, str(self.scan_interval))
+        self.interval_entry.pack(side='left', padx=(10, 0))
+        
+        # Botón para configurar intervalo
+        set_interval_btn = tk.Button(interval_frame, text="Configurar Intervalo",
+                                    bg='#3498db', fg='white', font=('Arial', 9, 'bold'),
+                                    command=self.set_scan_interval)
+        set_interval_btn.pack(side='left', padx=(10, 0))
+        
+        # Estado de conexión
+        self.connection_status = tk.Label(frame, text="Estado: Desconectado",
+                                         bg='#34495e', fg='#e74c3c', 
+                                         font=('Arial', 10, 'bold'))
+        self.connection_status.pack(pady=5)
+        
+        return frame
+    
+    def create_wifi_section(self, parent):
+        """Crear sección de redes WiFi"""
+        frame = tk.LabelFrame(parent, text="Redes WiFi Disponibles", 
+                             bg='#34495e', fg='#ecf0f1', 
+                             font=('Arial', 12, 'bold'), padx=10, pady=10)
+        
+        # Botones de control
+        control_frame = tk.Frame(frame, bg='#34495e')
+        control_frame.pack(fill='x', pady=(0, 10))
+        
+        self.scan_btn = tk.Button(control_frame, text="🔍 Escanear Redes",
+                            bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                            command=self.scan_wifi_networks)
+        self.scan_btn.pack(side='left', padx=(0, 10))
+        
+        refresh_btn = tk.Button(control_frame, text="🔄 Actualizar",
+                               bg='#f39c12', fg='white', font=('Arial', 10, 'bold'),
+                               command=self.refresh_all_data)
+        refresh_btn.pack(side='left', padx=(0, 10))
+        
+        disconnect_btn = tk.Button(control_frame, text="🔌 Desconectar",
+                                  bg='#e74c3c', fg='white', font=('Arial', 10, 'bold'),
+                                  command=self.disconnect_wifi)
+        disconnect_btn.pack(side='left')
+        
+        # Lista de redes WiFi
+        columns = ('SSID', 'Señal (dBm)', 'Seguridad', 'Canal')
+        self.wifi_tree = ttk.Treeview(frame, columns=columns, show='headings', height=8)
+        
+        # Configurar encabezados
+        for col in columns:
+            self.wifi_tree.heading(col, text=col)
+            self.wifi_tree.column(col, width=150)
+        
+        # Scrollbar para la lista
+        wifi_scrollbar = ttk.Scrollbar(frame, orient='vertical', command=self.wifi_tree.yview)
+        self.wifi_tree.configure(yscrollcommand=wifi_scrollbar.set)
+        
+        # Empaquetar Treeview y scrollbar
+        tree_frame = tk.Frame(frame, bg='#34495e')
+        tree_frame.pack(fill='both', expand=True, pady=(0, 10))
+        
+        self.wifi_tree.pack(side='left', fill='both', expand=True)
+        wifi_scrollbar.pack(side='right', fill='y')
+        
+        # Bind para doble clic
+        self.wifi_tree.bind('<Double-1>', self.on_wifi_select)
+        
+        # Frame para conexión
+        connect_frame = tk.Frame(frame, bg='#34495e')
+        connect_frame.pack(fill='x')
+        
+        tk.Label(connect_frame, text="Contraseña:", 
+                bg='#34495e', fg='#ecf0f1', font=('Arial', 10)).pack(side='left')
+        
+        self.password_entry = tk.Entry(connect_frame, font=('Arial', 10), 
+                                      width=20, show='*')
+        self.password_entry.pack(side='left', padx=(10, 0), fill='x', expand=True)
+        
+        connect_btn = tk.Button(connect_frame, text="Conectar",
+                               bg='#27ae60', fg='white', font=('Arial', 10, 'bold'),
+                               command=self.connect_to_wifi)
+        connect_btn.pack(side='right', padx=(10, 0))
+        
+        return frame
+    
+    def create_devices_section(self, parent):
+        """Crear sección de dispositivos de red"""
+        frame = tk.LabelFrame(parent, text="Dispositivos en la Red", 
+                             bg='#34495e', fg='#ecf0f1', 
+                             font=('Arial', 12, 'bold'), padx=10, pady=10)
+        
+        # Información de red
+        self.network_info = tk.Label(frame, text="Red: No conectado",
+                                    bg='#34495e', fg='#95a5a6', 
+                                    font=('Arial', 10))
+        self.network_info.pack(pady=(0, 10))
+        
+        # Lista de dispositivos
+        device_columns = ('IP', 'Tipo', 'MAC', 'Hostname', 'Estado', 'Última conexión')
+        self.devices_tree = ttk.Treeview(frame, columns=device_columns, 
+                                        show='headings', height=10)
+        
+        # Configurar encabezados
+        for col in device_columns:
+            self.devices_tree.heading(col, text=col)
+            self.devices_tree.column(col, width=120)
+        
+        # Scrollbar para dispositivos
+        devices_scrollbar = ttk.Scrollbar(frame, orient='vertical', 
+                                         command=self.devices_tree.yview)
+        self.devices_tree.configure(yscrollcommand=devices_scrollbar.set)
+        
+        # Frame para dispositivos
+        devices_tree_frame = tk.Frame(frame, bg='#34495e')
+        devices_tree_frame.pack(fill='both', expand=True, pady=(0, 10))
+        
+        self.devices_tree.pack(side='left', fill='both', expand=True)
+        devices_scrollbar.pack(side='right', fill='y')
+        
+        # Estadísticas
+        self.stats_label = tk.Label(frame, text="Dispositivos encontrados: 0",
+                                   bg='#34495e', fg='#3498db', 
+                                   font=('Arial', 10, 'bold'))
+        self.stats_label.pack()
+        
+        # Auto-refresh control
+        refresh_control_frame = tk.Frame(frame, bg='#34495e')
+        refresh_control_frame.pack(fill='x', pady=(10, 0))
+        
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        auto_refresh_check = tk.Checkbutton(refresh_control_frame, 
+                                           text="Actualización automática (10s)",
+                                           variable=self.auto_refresh_var,
+                                           bg='#34495e', fg='#ecf0f1',
+                                           selectcolor='#2c3e50',
+                                           font=('Arial', 9),
+                                           command=self.toggle_auto_refresh)
+        auto_refresh_check.pack(side='left')
+        
+        self.last_update_label = tk.Label(refresh_control_frame, 
+                                         text="Última actualización: --",
+                                         bg='#34495e', fg='#95a5a6', 
+                                         font=('Arial', 9))
+        self.last_update_label.pack(side='right')
+        
+        return frame
+    
+    def update_esp32_ip(self):
+        """Actualizar la IP del ESP32"""
+        new_ip = self.ip_entry.get().strip()
+        if new_ip:
+            self.esp32_ip = new_ip
+            self.refresh_all_data()
+    
+    def set_scan_interval(self):
+        """Configurar el intervalo de escaneo en el ESP32"""
+        try:
+            new_interval = int(self.interval_entry.get().strip())
+            if new_interval < 1:
+                messagebox.showerror("Error", "El intervalo debe ser al menos 1 segundo")
+                return
+            
+            try:
+                response = requests.post(f"http://{self.esp32_ip}/set_interval", 
+                                       data={'interval': new_interval}, timeout=5)
+                if response.status_code == 200:
+                    result = response.json()
+                    if result['success']:
+                        self.scan_interval = new_interval
+                        messagebox.showinfo("Éxito", f"Intervalo de escaneo configurado a {new_interval} segundos")
+                    else:
+                        messagebox.showerror("Error", "No se pudo configurar el intervalo")
+                else:
+                    messagebox.showerror("Error", f"Error del servidor: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                messagebox.showerror("Error", f"No se pudo conectar al ESP32: {str(e)}")
+        except ValueError:
+            messagebox.showerror("Error", "Por favor ingrese un número válido")
+    
+    def scan_wifi_networks(self):
+        """Escanear redes WiFi disponibles"""
+        try:
+            # Deshabilitar botón durante el escaneo
+            self.scan_btn.config(state='disabled', text="Escaneando...")
+            self.root.update()
+            
+            response = requests.get(f"http://{self.esp32_ip}/scan", timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                self.populate_wifi_list(data['networks'])
+            else:
+                messagebox.showerror("Error", f"Error del servidor: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            messagebox.showerror("Error de Conexión", 
+                               f"No se pudo conectar al ESP32:\n{str(e)}")
+        finally:
+            # Rehabilitar botón
+            self.scan_btn.config(state='normal', text="🔍 Escanear Redes")
+    
+    def populate_wifi_list(self, networks):
+        """Poblar la lista de redes WiFi"""
+        # Limpiar lista existente
+        for item in self.wifi_tree.get_children():
+            self.wifi_tree.delete(item)
+        
+        # Agregar redes
+        for network in networks:
+            signal_strength = network['rssi']
+            signal_quality = "Excelente" if signal_strength > -50 else \
+                            "Buena" if signal_strength > -60 else \
+                            "Regular" if signal_strength > -70 else "Débil"
+            
+            self.wifi_tree.insert('', 'end', values=(
+                network['ssid'],
+                f"{signal_strength} dBm ({signal_quality})",
+                network['encryption'],
+                network.get('channel', 'N/A')
+            ))
+    
+    def on_wifi_select(self, event):
+        """Manejar selección de red WiFi"""
+        selection = self.wifi_tree.selection()
+        if selection:
+            item = self.wifi_tree.item(selection[0])
+            ssid = item['values'][0]
+            # Autocompletar SSID si es necesario
+            print(f"Red seleccionada: {ssid}")
+    
+    def connect_to_wifi(self):
+        """Conectar a la red WiFi seleccionada"""
+        selection = self.wifi_tree.selection()
+        if not selection:
+            messagebox.showwarning("Advertencia", "Seleccione una red WiFi")
+            return
+        
+        item = self.wifi_tree.item(selection[0])
+        ssid = item['values'][0]
+        password = self.password_entry.get()
+        
+        if not password and "Secured" in item['values'][2]:
+            messagebox.showwarning("Advertencia", "Ingrese la contraseña para la red")
+            return
+        
+        try:
+            # Mostrar progreso
+            self.connection_status.config(text="Estado: Conectando...", fg='#f39c12')
+            self.root.update()
+            
+            data = {'ssid': ssid, 'password': password}
+            response = requests.post(f"http://{self.esp32_ip}/connect", 
+                                   data=data, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result['success']:
+                    self.connected = True
+                    self.connection_status.config(
+                        text=f"Estado: Conectado a {result['ssid']} ({result['ip']})", 
+                        fg='#27ae60')
+                    messagebox.showinfo("Éxito", 
+                                      f"Conectado exitosamente a {ssid}\nIP: {result['ip']}")
+                    self.password_entry.delete(0, tk.END)
+                    self.refresh_devices()
+                else:
+                    self.connection_status.config(text="Estado: Error de conexión", fg='#e74c3c')
+                    messagebox.showerror("Error", "No se pudo conectar a la red")
+            else:
+                self.connection_status.config(text="Estado: Error", fg='#e74c3c')
+                messagebox.showerror("Error", f"Error del servidor: {response.status_code}")
+                
+        except requests.exceptions.RequestException as e:
+            self.connection_status.config(text="Estado: Error de comunicación", fg='#e74c3c')
+            messagebox.showerror("Error de Conexión", 
+                               f"Error de comunicación con ESP32:\n{str(e)}")
+    
+    def disconnect_wifi(self):
+        """Desconectar de la red WiFi"""
+        try:
+            response = requests.post(f"http://{self.esp32_ip}/disconnect", timeout=10)
+            if response.status_code == 200:
+                self.connected = False
+                self.connection_status.config(text="Estado: Desconectado", fg='#e74c3c')
+                
+                # Limpiar lista de dispositivos
+                for item in self.devices_tree.get_children():
+                    self.devices_tree.delete(item)
+                
+                self.network_info.config(text="Red: No conectado")
+                self.stats_label.config(text="Dispositivos encontrados: 0")
+                
+                messagebox.showinfo("Info", "Desconectado de la red WiFi")
+            else:
+                messagebox.showerror("Error", f"Error del servidor: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            messagebox.showerror("Error", f"Error de comunicación: {str(e)}")
+    
+    def refresh_devices(self):
+        """Actualizar lista de dispositivos"""
+        try:
+            response = requests.get(f"http://{self.esp32_ip}/devices", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                self.populate_devices_list(data)
+                self.update_network_info(data.get('networkInfo', {}))
+            else:
+                print(f"Error al obtener dispositivos: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error de conexión al obtener dispositivos: {e}")
+    
+    def populate_devices_list(self, data):
+        """Poblar lista de dispositivos"""
+        # Limpiar lista existente
+        for item in self.devices_tree.get_children():
+            self.devices_tree.delete(item)
+        
+        devices = data.get('devices', [])
+        
+        for device in devices:
+            device_type = device.get('type', 'Unknown')
+            status = "🟢 Activo" if device.get('active', False) else "🔴 Inactivo"
+            
+            # Formatear última conexión
+            last_seen = device.get('lastSeen')
+            if last_seen:
+                last_seen_str = datetime.fromtimestamp(last_seen/1000).strftime('%H:%M:%S')
+            else:
+                last_seen_str = "N/A"
+            
+            self.devices_tree.insert('', 'end', values=(
+                device.get('ip', 'N/A'),
+                device_type,
+                device.get('mac', 'Unknown'),
+                device.get('hostname', 'Unknown'),
+                status,
+                last_seen_str
+            ))
+        
+        # Actualizar estadísticas
+        self.stats_label.config(text=f"Dispositivos encontrados: {len(devices)}")
+        
+        # Actualizar timestamp
+        now = datetime.now().strftime('%H:%M:%S')
+        self.last_update_label.config(text=f"Última actualización: {now}")
+    
+    def update_network_info(self, network_info):
+        """Actualizar información de la red"""
+        if network_info:
+            subnet = network_info.get('subnet', 'N/A')
+            network = network_info.get('network', 'N/A')
+            broadcast = network_info.get('broadcast', 'N/A')
+            gateway = network_info.get('gateway', 'N/A')
+            
+            info_text = f"Red: {network}/{subnet} | Gateway: {gateway} | Rango: {network} - {broadcast}"
+            self.network_info.config(text=info_text)
+    
+    def refresh_all_data(self):
+        """Actualizar todos los datos"""
+        self.check_connection_status()
+        if self.connected:
+            self.refresh_devices()
+    
+    def check_connection_status(self):
+        """Verificar estado de conexión"""
+        try:
+            response = requests.get(f"http://{self.esp32_ip}/status", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('connected', False):
+                    self.connected = True
+                    ssid = data.get('ssid', 'Unknown')
+                    ip = data.get('ip', 'Unknown')
+                    rssi = data.get('rssi', 0)
+                    
+                    signal_quality = "Excelente" if rssi > -50 else \
+                                    "Buena" if rssi > -60 else \
+                                    "Regular" if rssi > -70 else "Débil"
+                    
+                    status_text = f"Conectado a {ssid} ({ip}) - Señal: {signal_quality}"
+                    self.connection_status.config(text=f"Estado: {status_text}", fg='#27ae60')
+                else:
+                    self.connected = False
+                    self.connection_status.config(text="Estado: Desconectado", fg='#e74c3c')
+            else:
+                self.connection_status.config(text="Estado: Error de comunicación", fg='#e74c3c')
+        except requests.exceptions.RequestException:
+            self.connection_status.config(text="Estado: ESP32 no accesible", fg='#e74c3c')
+    
+    def toggle_auto_refresh(self):
+        """Activar/desactivar actualización automática"""
+        self.auto_refresh = self.auto_refresh_var.get()
+    
+    def start_auto_refresh(self):
+        """Iniciar el hilo de actualización automática"""
+        def auto_refresh_thread():
+            while True:
+                if self.auto_refresh:
+                    try:
+                        self.refresh_all_data()
+                    except:
+                        pass  # Ignorar errores en el hilo de fondo
+                time.sleep(self.refresh_interval)
+        
+        # Iniciar hilo daemon
+        refresh_thread = threading.Thread(target=auto_refresh_thread, daemon=True)
+        refresh_thread.start()
+
+def main():
+    """Función principal"""
+    root = tk.Tk()
+    app = WiFiManagerGUI(root)
+    
+    # Configurar el cierre de la aplicación
+    def on_closing():
+        app.auto_refresh = False
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
+    # Mostrar instrucciones iniciales
+    messagebox.showinfo("Instrucciones de Uso", 
+                       """ESP32-S3 WiFi Manager - Instrucciones:
+
+1. Asegúrate de que el ESP32-S3 esté encendido y ejecutando el código
+2. Conecta tu PC a la red WiFi 'ESP32-WiFiConfig' (contraseña: 12345678)
+3. La IP por defecto es 192.168.4.1
+4. Haz clic en 'Escanear Redes' para ver redes disponibles
+5. Selecciona una red, ingresa la contraseña y conecta
+6. Una vez conectado, verás los dispositivos en la red automáticamente
+
+Características:
+- Escaneo automático de dispositivos cada 10 segundos
+- Detección de rango de red con máscara /28 (255.255.255.240)
+- Interfaz moderna con indicadores visuales de estado""")
+    
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
